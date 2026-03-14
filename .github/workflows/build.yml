@@ -1,0 +1,130 @@
+name: Build Installer NSP
+on:
+  push:
+    branches: [ main ]
+  workflow_dispatch:
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup hacpack and keys
+        run: |
+          echo "${{ secrets.HACPACK_KEYS }}" > keys.dat
+
+          # Write optional keys only if secrets are present
+          if [ -n "${{ secrets.NCASIG2_PRIVATE_KEY }}" ]; then
+            echo "${{ secrets.NCASIG2_PRIVATE_KEY }}" > ncasig2_private.pem
+            openssl rsa -in ncasig2_private.pem -noout -modulus | \
+              sed 's/Modulus=//' | \
+              python3 -c "import sys, binascii; sys.stdout.buffer.write(binascii.unhexlify(sys.stdin.read().strip()))" \
+              > ncasig2_modulus.bin
+          fi
+          if [ -n "${{ secrets.ACID_PRIVATE_KEY }}" ]; then
+            echo "${{ secrets.ACID_PRIVATE_KEY }}" > acid_private.pem
+          fi
+          if [ -n "${{ secrets.NCASIG1_PRIVATE_KEY }}" ]; then
+            echo "${{ secrets.NCASIG1_PRIVATE_KEY }}" > ncasig1_private.pem
+          fi
+
+          chmod +x tools/hacpack
+
+      - name: Prepare NSP build directories
+        run: |
+          mkdir -p nca nsp control_romfs
+          
+      - name: Generate control romfs
+        run: python3 tools/generate_control.py icon.jpg control_romfs/
+
+      - name: Build Control NCA
+        run: |
+          HACPACK_FLAGS="-k ./keys.dat \
+            -o ./nca/ \
+            --type nca \
+            --keygeneration 21 \
+            --sdkversion 15040000 \
+            --ncatype control \
+            --titleid 01DABBED00010000 \
+            --romfsdir ./control_romfs/"
+
+          if [ -f acid_private.pem ]; then
+            HACPACK_FLAGS="$HACPACK_FLAGS --acidsigprivatekey ./acid_private.pem"
+          fi
+          if [ -f ncasig1_private.pem ]; then
+            HACPACK_FLAGS="$HACPACK_FLAGS --ncasig1privatekey ./ncasig1_private.pem"
+          fi
+
+          tools/hacpack $HACPACK_FLAGS
+
+          # Record control NCA name before program NCA is added
+          CONTROL_NCA=$(ls nca/ | grep "\.nca$" | head -1)
+          echo "CONTROL_NCA=$CONTROL_NCA" >> $GITHUB_ENV
+
+      - name: Build Program NCA
+        run: |
+          HACPACK_FLAGS="-k ./keys.dat \
+            -o ./nca/ \
+            --type nca \
+            --keygeneration 21 \
+            --sdkversion 15040000 \
+            --ncatype program \
+            --titleid 01DABBED00010000 \
+            --exefsdir ./exefs/ \
+            --romfsdir ./romfs/ \
+            --logodir ./logo/"
+
+          if [ -f ncasig2_private.pem ]; then
+            HACPACK_FLAGS="$HACPACK_FLAGS --ncasig2privatekey ./ncasig2_private.pem"
+            HACPACK_FLAGS="$HACPACK_FLAGS --ncasig2modulus ./ncasig2_modulus.bin"
+          fi
+          if [ -f acid_private.pem ]; then
+            HACPACK_FLAGS="$HACPACK_FLAGS --acidsigprivatekey ./acid_private.pem"
+          fi
+          if [ -f ncasig1_private.pem ]; then
+            HACPACK_FLAGS="$HACPACK_FLAGS --ncasig1privatekey ./ncasig1_private.pem"
+          fi
+
+          tools/hacpack $HACPACK_FLAGS
+
+          PROGRAM_NCA=$(ls nca/ | grep -v "${{ env.CONTROL_NCA }}" | grep "\.nca$" | head -1)
+          echo "PROGRAM_NCA=$PROGRAM_NCA" >> $GITHUB_ENV
+
+      - name: Build Meta NCA
+        run: |
+          tools/hacpack \
+            -k ./keys.dat \
+            -o ./nca/ \
+            --type nca \
+            --keygeneration 21 \
+            --sdkversion 15040000 \
+            --ncatype meta \
+            --titletype application \
+            --titleid 01DABBED00010000 \
+            --requiredsystemversion 21.2.0 \
+            --programnca ./nca/${{ env.PROGRAM_NCA }} \
+            --controlnca ./nca/${{ env.CONTROL_NCA }}
+
+      - name: Build NSP
+        run: |
+          tools/hacpack \
+            -k ./keys.dat \
+            -o ./nsp/ \
+            --type nsp \
+            --ncadir ./nca/ \
+            --titleid 01DABBED00010000
+
+      - name: Cleanup sensitive files
+        if: always()
+        run: rm -f keys.dat acid_private.pem ncasig1_private.pem ncasig2_private.pem ncasig2_modulus.bin
+
+      - name: Rename NSP
+        run: mv nsp/01dabbed00010000.nsp "nsp/Portal 64 Installer [01DABBED00010000][v0].nsp"
+
+      - name: Upload NSP
+        uses: actions/upload-artifact@v4
+        with:
+          name: Installer-nsp
+          path: nsp/*.nsp
